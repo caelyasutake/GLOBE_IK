@@ -25,13 +25,12 @@ __constant__ double c_omega[N];
 
 template<typename T>
 __device__ __forceinline__ void joint_limits(T* __restrict__ theta, int tid) {
-    // Clamp the angle using the limits in constant memory.
+    // Clamp the angle using the limits in constant memory
     *theta = fmaxf(fminf(*theta, c_omega[tid]), -c_omega[tid]);
 }
 
 template<typename T>
 __device__ __forceinline__ T dot_product(const T* __restrict__ v1, const T* __restrict__ v2) {
-    // Since DIM==3, manually unroll the dot product.
     return v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
 }
 
@@ -285,7 +284,7 @@ __device__ void compute_projections(T* u, T* v, T* u_proj, T* v_proj, T* r, T* t
     *theta_proj = acosf(v_u_proj);
 }
 
-// Global counter for solutions found.
+// Global counter for solutions found
 __device__ int n_solutions = 0;
 
 template<typename T>
@@ -313,9 +312,8 @@ __global__ void globeik_kernel(
     __shared__ double s_glob_err[IK_PER_BLOCK];
     __shared__ T s_theta[IK_PER_BLOCK][N];
 
-    // Shared memory for FK matrices (each problem has 7 matrices; 7 * 16 = 112 elements)
+    // Shared memory for FK matrices
     //__shared__ T s_XmatsHom[IK_PER_BLOCK][grid::NUM_JOINTS * 16];
-    // Temporary storage needed by the FK helper (size 14 per problem)
     //__shared__ T s_temp_arr[IK_PER_BLOCK][14];
 
     // For all threads (active or not) in each subgroup, call the helper.
@@ -350,7 +348,6 @@ __global__ void globeik_kernel(
     }
     __syncthreads();
 
-    // Now, let a single thread per subgroup (joint==0) compute cumulative joint positions and print debug info.
     /*
     if (active && joint == 0) {
         compute_cumulative_joint_positions(s_ee[local_ik],
@@ -377,7 +374,6 @@ __global__ void globeik_kernel(
     int prev_joint = N;
     while (k < k_max) {
         T joint_pos[DIM];
-        // Update the FK matrices unconditionally.
         /*
         {
             grid::load_update_XmatsHom_helpers(&s_XmatsHom[local_ik][0],
