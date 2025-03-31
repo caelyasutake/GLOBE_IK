@@ -24,7 +24,7 @@ namespace grid {
 #include <cuda_runtime.h>
 
 #define DIM 3
-#define IK_PER_BLOCK 4
+#define IK_PER_BLOCK 1
 
 template<typename T>
 __global__ void globeik_kernel(
@@ -33,10 +33,11 @@ __global__ void globeik_kernel(
     const T* __restrict__ target_pos,
     double* __restrict__ errors,
     int num_solutions,
-    int totalProblems,
+    int total_problems,
     const grid::robotModel<T>* d_robotModel,
     const double epsilon = 0.004,
-    const int k_max = 20);
+    const double gamma = 0.5,
+    const int k_max = 1);
 
 template<typename T>
 struct Result {

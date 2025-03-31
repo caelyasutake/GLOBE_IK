@@ -8,8 +8,8 @@
 #include <chrono>
 #include <thread>
 
-#define NUM_RANDOM_TARGETS 100
-#define NUM_SOLUTIONS 1000
+#define NUM_RANDOM_TARGETS 1
+#define NUM_SOLUTIONS 1
 
 // Take best error from num_solutions = 1000, num_random_targets = 1000
 
@@ -60,9 +60,8 @@ int main() {
         Result<double> res;
 
         // Run on the current target
-        for (int j = 0; j < 10; j++) {
-            res = generate_ik_solutions<double>(target_pos, d_robotModel, NUM_SOLUTIONS);
-        }
+        //for (int i=0; i<10; i++) 
+        res = generate_ik_solutions<double>(target_pos, d_robotModel, NUM_SOLUTIONS);
         
         // Calculate the average error for this target
         double avg_serr = 0.0;
