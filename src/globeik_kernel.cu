@@ -23,6 +23,7 @@
 // Constant memory for joint limits
 __constant__ double c_omega[N];
 
+// Need a GRiD joint limits function
 template<typename T>
 __device__ __forceinline__ void joint_limits(T* __restrict__ theta, int tid) {
     // Clamp the angle using the limits in constant memory
@@ -101,6 +102,40 @@ __device__ void compute_rotation_axis(T* r, const T* s_XmatsHom, int tid) {
 }
 */
 
+// quat = wxyz
+template<typename T>
+__device__ void mat_to_quat(T* s_XmatsHom, T* quat) {
+    float tr = s_XmatsHom[0] + s_XmatsHom[5] + s_XmatsHom[10];
+    if (tr > 0) {
+        float S = sqrt(tr + 1.0) * 2;
+        quat[0] = 0.25 * S;
+        quat[1] = (s_XmatsHom[6] - s_XmatsHom[9]) / S;
+        quat[2] = (s_XmatsHom[8] - s_XmatsHom[2]) / S;
+        quat[3] = (s_XmatsHom[1] - s_XmatsHom[4]) / S;
+    }
+    else if ((s_XmatsHom[0] > s_XmatsHom[5]) & (s_XmatsHom[0] > s_XmatsHom[10])) {
+        float S = sqrt(1.0 + s_XmatsHom[0] - s_XmatsHom[5] - s_XmatsHom[10]) * 2;
+        quat[0] = (s_XmatsHom[6] - s_XmatsHom[9]) / S;
+        quat[1] = 0.25 * S;
+        quat[2] = (s_XmatsHom[4] + s_XmatsHom[1]) / S;
+        quat[3] = (s_XmatsHom[8] + s_XmatsHom[2]) / S;
+    }
+    else if (s_XmatsHom[5] > s_XmatsHom[10]) {
+        float S = sqrt(1.0 + s_XmatsHom[5] - s_XmatsHom[0] - s_XmatsHom[10]) * 2;
+        quat[0] = (s_XmatsHom[8] - s_XmatsHom[2]) / S;
+        quat[1] = (s_XmatsHom[4] + s_XmatsHom[1]) / S;
+        quat[2] = 0.25 * S;
+        quat[3] = (s_XmatsHom[9] + s_XmatsHom[6]) / S;
+    }
+    else {
+        float S = sqrt(1.0 + s_XmatsHom[10] - s_XmatsHom[0] - s_XmatsHom[5]) * 2;
+        quat[0] = (s_XmatsHom[1] - s_XmatsHom[4]) / S;
+        quat[1] = (s_XmatsHom[8] + s_XmatsHom[2]) / S;
+        quat[2] = (s_XmatsHom[9] + s_XmatsHom[6]) / S;
+        quat[3] = 0.25 * S;
+    }
+}
+
 template<typename T>
 __device__ void print_trans_mat(T* s_XmatsHom, int mat) {
     if (threadIdx.x == 0) {
@@ -134,6 +169,7 @@ __device__ void print_vec(T* joint_pos, int joint) {
     printf("Joint Position [%d]: %f %f %f\n", joint, joint_pos[0], joint_pos[1], joint_pos[2]);
 }
 
+/*
 template<typename T>
 __device__ void compute_rotation_axis(T* r, T* x, int tid) {
     T sin_x0 = sinf(x[0]), cos_x0 = cosf(x[0]);
@@ -178,6 +214,28 @@ __device__ void compute_rotation_axis(T* r, T* x, int tid) {
             - ((sin_x0 * cos_x1 * cos_x2 + sin_x2 * cos_x0) * sin_x3 - sin_x0 * sin_x1 * cos_x3) * cos_x5;
         r[2] = ((-sin_x1 * cos_x2 * cos_x3 + sin_x3 * cos_x1) * cos_x4 + sin_x1 * sin_x2 * sin_x4) * sin_x5
             - (-sin_x1 * sin_x3 * cos_x2 - cos_x1 * cos_x3) * cos_x5;
+    }
+}
+*/
+
+template<typename T>
+__device__ void compute_rotation_axis(T* joint_quat, T* r) {
+    T w = joint_quat[0];
+    T x = joint_quat[1];
+    T y = joint_quat[2];
+    T z = joint_quat[3];
+
+    T sin_half_theta = sqrt(1.0 - w * w);
+
+    if (sin_half_theta > 1e-6) {
+        r[0] = x / sin_half_theta;
+        r[1] = y / sin_half_theta;
+        r[2] = z / sin_half_theta;
+    }
+    else {
+        r[0] = 1.0;
+        r[1] = 0.0;
+        r[2] = 0.0;
     }
 }
 
@@ -251,7 +309,7 @@ __global__ void globeik_kernel(
     
     // Load joint configs into shared memory
     if (active && joint < N) {
-        s_x[local_ik][joint] = 0;// [global_problem * N + joint] ;
+        s_x[local_ik][joint] = x[global_problem * N + joint];
     }
     __syncthreads();
 
@@ -267,7 +325,7 @@ __global__ void globeik_kernel(
     );
     __syncthreads();
 
-    //if (threadIdx.x == 6) {
+    //if (threadIdx.x == 0) {
     //    printf("EE Pos (GLOBE-IK): %f %f %f\n",
     //        s_jointXforms[local_ik][16*6 + 12],
     //        s_jointXforms[local_ik][16*6 + 13],
@@ -310,8 +368,84 @@ __global__ void globeik_kernel(
     //    printf("\n");
     //}
 
+    int k = 0; 
+    int prev_joint = N;
+    while (k < k_max) {
+        T joint_pos[DIM];
+        T joint_quat[4];
 
+        grid::update_jointTransforms(
+            s_jointXforms[local_ik],
+            s_XmatsHom[local_ik],
+            s_x[local_ik],
+            s_temp[local_ik]
+        );
+        __syncthreads();
 
+        joint_pos[0] = s_XmatsHom[local_ik][threadIdx.x * 12];
+        joint_pos[1] = s_XmatsHom[local_ik][threadIdx.x * 13];
+        joint_pos[2] = s_XmatsHom[local_ik][threadIdx.x * 14];
+
+        mat_to_quat(s_XmatsHom[local_ik], joint_quat);
+
+        T u0 = s_ee[local_ik][0] - joint_pos[0];
+        T u1 = s_ee[local_ik][1] - joint_pos[1];
+        T u2 = s_ee[local_ik][2] - joint_pos[2];
+        T v0 = target_pos[0] - joint_pos[0];
+        T v1 = target_pos[1] - joint_pos[1];
+        T v2 = target_pos[2] - joint_pos[2];
+
+        T r[DIM];
+        compute_rotation_axis(joint_quat, r);
+
+        T u_r = u0 * r[0] + u1 * r[1] + u2 * r[2];
+        T v_r = v0 * r[0] + v1 * r[1] + v2 * r[2];
+        T uproj0 = u0 - u_r * r[0];
+        T uproj1 = u1 - u_r * r[1];
+        T uproj2 = u2 - u_r * r[2];
+        T vproj0 = v0 - v_r * r[0];
+        T vproj1 = v1 - v_r * r[1];
+        T vproj2 = v2 - v_r * r[2];
+        T uproj_norm = sqrt(uproj0 * uproj0 + uproj1 * uproj1 + uproj2 * uproj2);
+        T vproj_norm = sqrt(vproj0 * vproj0 + vproj1 * vproj1 + vproj2 * vproj2);
+        if (uproj_norm > 1e-6) {
+            uproj0 /= uproj_norm; uproj1 /= uproj_norm; uproj2 /= uproj_norm;
+        }
+        if (vproj_norm > 1e-6) {
+            vproj0 /= vproj_norm; vproj1 /= vproj_norm; vproj2 /= vproj_norm;
+        }
+
+        T dotp = uproj0 * vproj0 + uproj1 * vproj1 + uproj2 * vproj2;
+        dotp = min(max(dotp, -1.0f), 1.0f);
+        T theta = acos(dotp);
+
+        T grad = 0.0;
+        grad += 2.0 * (s_ee[local_ik][0] - target_pos[0]) * (-r[0]);
+        grad += 2.0 * (s_ee[local_ik][1] - target_pos[1]) * (-r[1]);
+        grad += 2.0 * (s_ee[local_ik][2] - target_pos[2]) * (-r[2]);
+        T alpha = (k > k_max / 2) ? 1.0 : 0.75;
+        T theta_update = (grad > 0.0) ? -alpha * theta : alpha * theta;
+
+        T candidate_joint = s_x[local_ik][joint] + theta_update;
+        joint_limits(&candidate_joint, joint);
+
+        T candidate[N];
+#pragma unroll
+        for (int i = 0; i < N; i++) {
+            candidate[i] = (i == joint) ? candidate_joint : s_x[local_ik][i];
+        }
+
+        T candidate_ee[DIM];
+        grid::update_jointTransforms(
+            s_jointXforms[local_ik],
+            s_XmatsHom[local_ik],
+            s_x[local_ik],
+            s_temp[local_ik]
+        );
+        grid::update_jointTransforms(
+            
+        )
+    }
 }
 
 /*
