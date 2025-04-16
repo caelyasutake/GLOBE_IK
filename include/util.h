@@ -5,8 +5,8 @@
 #include <cmath>
 
 // Used to generate random targets for benchmarking
-inline std::vector<std::vector<double>> generate_random_targets(int num_targets) {
-    std::vector<std::vector<double>> random_targets;
+inline std::vector<std::vector<float>> generate_random_targets(int num_targets) {
+    std::vector<std::vector<float>> random_targets;
     std::mt19937 gen(1337); // Set seed for target generation
 
     // For deciding which interval to use
@@ -21,7 +21,9 @@ inline std::vector<std::vector<double>> generate_random_targets(int num_targets)
 
     // Ensure points are within the robot workspace (e.g., inside a unit sphere)
     for (int i = 0; i < num_targets; ++i) {
-        double x, y, z;
+        float x, y, z;
+        float qw, qx, qy, qz;
+        qw = 0; qx = 0; qy = 0; qz = 0;
         do {
             // Choose interval for x
             if (dist_choice(gen) < 0.5) {
@@ -44,7 +46,7 @@ inline std::vector<std::vector<double>> generate_random_targets(int num_targets)
 
         } while (std::sqrt(x * x + y * y + z * z) > 0.7);
 
-        random_targets.push_back({ x, y, z });
+        random_targets.push_back({ x, y, z , qw, qx, qy, qz});
     }
 
     return random_targets;

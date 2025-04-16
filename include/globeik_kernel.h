@@ -20,32 +20,40 @@ namespace grid {
 #endif
 #endif
 
+#ifndef NUM_SOLUTIONS
+#define NUM_SOLUTIONS 1
+#endif
+
+#ifndef BATCH_SIZE
+#define BATCH_SIZE 1000
+#endif 
+
 #include "util.h"
 #include <cuda_runtime.h>
-
-#define DIM 3
-#define IK_PER_BLOCK 1
 
 template<typename T>
 __global__ void globeik_kernel(
     T* __restrict__ x,
-    T* __restrict__ pos,
-    const T* __restrict__ target_pos,
-    double* __restrict__ errors,
+    T* __restrict__ pose,
+    const T* __restrict__ target_pose,
+    float* __restrict__ pos_errors,
+    float* __restrict__ ori_errors,
     int num_solutions,
     int total_problems,
     const grid::robotModel<T>* d_robotModel,
-    const double epsilon = 0.004,
-    const double gamma = 0.5,
-    const int k_max = 1);
+    const float epsilon = 0.001,
+    const float gamma = 0.5,
+    const float nu = 2.0,
+    const int k_max = 20);
 
 template<typename T>
 struct Result {
     T* joint_config;
-    T* ee_pos;
-    double* errors;
+    T* pose;
+    float* pos_errors;
+    float* ori_errors;
     float elapsed_time;
 };
 
 template<typename T>
-Result<T> generate_ik_solutions(T* target_pos, const grid::robotModel<T>* d_robotModel, int num_solutions);
+Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_robotModel, int num_solutions);
