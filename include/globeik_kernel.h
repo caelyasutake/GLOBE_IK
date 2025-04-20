@@ -44,7 +44,7 @@ __global__ void globeik_kernel(
     const float epsilon = 0.001,
     const float gamma = 0.5,
     const float nu = 2.0,
-    const int k_max = 20);
+    const int k_max = 10);
 
 template<typename T>
 struct Result {
