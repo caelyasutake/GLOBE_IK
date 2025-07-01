@@ -2005,6 +2005,143 @@ namespace grid {
         __syncthreads();
     }
 
+<<<<<<< HEAD
+=======
+    /*
+     * Update for GLOBE-IK
+     */
+     /**
+      * Computes the End Effector Position
+      *
+      * Notes:
+      *   Assumes the Xhom matricies have already been updated for the given q
+      *
+      * @param s_eePos is a pointer to shared memory of size 6*NUM_EE where NUM_EE = 1
+      * @param s_q is the vector of joint positions
+      * @param s_Xhom is the pointer to the homogenous transformation matricies
+      * @param s_temp is a pointer to helper shared memory of size 32
+      */
+    /*
+    template <typename T>
+    __device__ void update_jointTransforms(T* s_jointXforms,
+        T* s_XmatsHom,
+        const T* s_q,
+        const robotModel<T>* d_robotModel,
+        T* s_temp) {
+        // 1. Precompute sin and cos for each of the 7 joint angles.
+        //    Store sin(q[i]) in s_temp[i] and cos(q[i]) in s_temp[i+7].
+        for (int k = threadIdx.x + threadIdx.y * blockDim.x; k < 7;
+            k += blockDim.x * blockDim.y) {
+            s_temp[k] = sin(s_q[k]);
+            s_temp[k + 7] = cos(s_q[k]);
+        }
+        __syncthreads();
+
+        // 2. Update the local homogeneous transforms for each joint.
+        //    Each branch (threadIdx.x from 0 to 6) updates one 4x4 matrix in s_XmatsHom.
+        if (threadIdx.x == 0) {
+            // Joint 0 local transform (indices 0..15)
+            // Example update: update rotation elements using sin and cos.
+            s_XmatsHom[0] = s_temp[7];   // cos(q0)
+            s_XmatsHom[1] = s_temp[0];   // sin(q0)
+            s_XmatsHom[4] = -s_temp[0];
+            s_XmatsHom[5] = s_temp[7];
+            // (Other elements could be set to complete a full transform.)
+        }
+        else if (threadIdx.x == 1) {
+            // Joint 1 local transform (indices 16..31)
+            s_XmatsHom[16] = -s_temp[8];
+            s_XmatsHom[18] = s_temp[1];
+            s_XmatsHom[20] = s_temp[1];
+            s_XmatsHom[22] = s_temp[8];
+        }
+        else if (threadIdx.x == 2) {
+            // Joint 2 local transform (indices 32..47)
+            s_XmatsHom[32] = -s_temp[9];
+            s_XmatsHom[34] = s_temp[2];
+            s_XmatsHom[36] = s_temp[2];
+            s_XmatsHom[38] = s_temp[9];
+        }
+        else if (threadIdx.x == 3) {
+            // Joint 3 local transform (indices 48..63)
+            s_XmatsHom[48] = s_temp[10];
+            s_XmatsHom[50] = s_temp[3];
+            s_XmatsHom[52] = -s_temp[3];
+            s_XmatsHom[54] = s_temp[10];
+        }
+        else if (threadIdx.x == 4) {
+            // Joint 4 local transform (indices 64..79)
+            s_XmatsHom[64] = -s_temp[11];
+            s_XmatsHom[66] = s_temp[4];
+            s_XmatsHom[68] = s_temp[4];
+            s_XmatsHom[70] = s_temp[11];
+        }
+        else if (threadIdx.x == 5) {
+            // Joint 5 local transform (indices 80..95)
+            s_XmatsHom[80] = s_temp[12];
+            s_XmatsHom[82] = s_temp[5];
+            s_XmatsHom[84] = -s_temp[5];
+            s_XmatsHom[86] = s_temp[12];
+        }
+        else if (threadIdx.x == 6) {
+            // Joint 6 local transform (indices 96..111)
+            s_XmatsHom[96] = -s_temp[13];
+            s_XmatsHom[98] = s_temp[6];
+            s_XmatsHom[100] = s_temp[6];
+            s_XmatsHom[102] = s_temp[13];
+        }
+        __syncthreads();
+
+        // 3. Compute cumulative transforms for each joint.
+        //    For joint 0, the cumulative transform is simply its local transform.
+        for (int ind = threadIdx.x + threadIdx.y * blockDim.x;
+            ind < 16;
+            ind += blockDim.x * blockDim.y) {
+            s_jointXforms[ind] = s_XmatsHom[ind];  // Joint 0 transform stored at s_jointXforms[0..15]
+        }
+        __syncthreads();
+
+        // For joints 1 through 6, compute:
+        //    T_i = T_{i-1} * local_transform[i]
+        // We'll use s_temp as a temporary buffer.
+        // The multiplication is done element-wise in parallel (each thread computes one element).
+        for (int i = 1; i < 7; i++) {
+            // Copy the cumulative transform for joint (i-1) into s_temp[0..15]
+            for (int ind = threadIdx.x + threadIdx.y * blockDim.x;
+                ind < 16;
+                ind += blockDim.x * blockDim.y) {
+                s_temp[ind] = s_jointXforms[(i - 1) * 16 + ind];
+            }
+            __syncthreads();
+
+            // Multiply T_prev (in s_temp[0..15]) with local_transform[i] (in s_XmatsHom[i*16 ... i*16+15]).
+            // Write the result into s_temp[16..31]. We assume row–major order.
+            for (int ind = threadIdx.x + threadIdx.y * blockDim.x;
+                ind < 16;
+                ind += blockDim.x * blockDim.y) {
+                int row = ind / 4;
+                int col = ind % 4;
+                T sum = static_cast<T>(0);
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    sum += s_temp[row * 4 + k] * s_XmatsHom[i * 16 + k * 4 + col];
+                }
+                s_temp[16 + ind] = sum;
+            }
+            __syncthreads();
+
+            // Write the computed cumulative transform for joint i into s_jointXforms.
+            for (int ind = threadIdx.x + threadIdx.y * blockDim.x;
+                ind < 16;
+                ind += blockDim.x * blockDim.y) {
+                s_jointXforms[i * 16 + ind] = s_temp[16 + ind];
+            }
+            __syncthreads();
+        }
+    }
+    */
+
+>>>>>>> c8eac0d994a6349f6816c1b69955f85a45cd6cfa
     template <typename T>
     __device__ void update_jointTransforms(T* s_jointXforms,
         T* s_XmatsHom,

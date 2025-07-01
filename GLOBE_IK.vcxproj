@@ -18,11 +18,14 @@
     <ClInclude Include="include\util.h" />
   </ItemGroup>
   <ItemGroup>
+<<<<<<< HEAD
     <None Include="plot_ik_csv_results.py" />
     <None Include="scatter_plot.py" />
     <None Include="text_to_csv.py" />
   </ItemGroup>
   <ItemGroup>
+=======
+>>>>>>> c8eac0d994a6349f6816c1b69955f85a45cd6cfa
     <CudaCompile Include="src\globeik_kernel.cu" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
