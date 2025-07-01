@@ -18,6 +18,7 @@
     <ClInclude Include="include\util.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="plot_ik_csv_results.py" />
     <None Include="scatter_plot.py" />
     <None Include="text_to_csv.py" />
   </ItemGroup>

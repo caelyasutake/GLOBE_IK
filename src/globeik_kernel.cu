@@ -1,5 +1,6 @@
 ﻿#include "include/globeik_kernel.h"
 #include <GRiD/grid.cuh>
+//#include <GRiD/panda_grid.cuh>
 
 #include <random>
 #include <thrust/device_vector.h>
@@ -16,8 +17,12 @@
 #include <thread>
 #include <vector>
 
+#include <curand_kernel.h>
+
 #define N grid::NUM_JOINTS
-#define IK_PER_BLOCK 4
+#define IK_PER_BLOCK 16
+
+#define PI 3.14159265358979323846f
 
 // Constant memory for joint limits
 __constant__ float c_omega[N];
@@ -40,82 +45,65 @@ __device__ __forceinline__ void compute_norm(const T* __restrict__ vec, T* __res
     *norm = sqrtf(s);
 }
 
-// quat = wxyz
+template<typename T>
+__device__ __forceinline__ T compute_norm(const T* __restrict__ v) {
+    T s = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    return sqrtf(s);
+}
+
 template<typename T>
 __device__ void mat_to_quat(T* s_XmatsHom, T* quat) {
-    float tr = s_XmatsHom[0] + s_XmatsHom[5] + s_XmatsHom[10];
-    if (tr > 0) {
-        float S = sqrt(tr + 1.0) * 2;
-        quat[0] = 0.25 * S;
-        quat[1] = (s_XmatsHom[6] - s_XmatsHom[9]) / S;
-        quat[2] = (s_XmatsHom[8] - s_XmatsHom[2]) / S;
-        quat[3] = (s_XmatsHom[1] - s_XmatsHom[4]) / S;
-    }
-    else if ((s_XmatsHom[0] > s_XmatsHom[5]) && (s_XmatsHom[0] > s_XmatsHom[10])) {
-        float S = sqrt(1.0 + s_XmatsHom[0] - s_XmatsHom[5] - s_XmatsHom[10]) * 2;
-        quat[0] = (s_XmatsHom[6] - s_XmatsHom[9]) / S;
-        quat[1] = 0.25 * S;
-        quat[2] = (s_XmatsHom[4] + s_XmatsHom[1]) / S;
-        quat[3] = (s_XmatsHom[8] + s_XmatsHom[2]) / S;
-    }
-    else if (s_XmatsHom[5] > s_XmatsHom[10]) {
-        float S = sqrt(1.0 + s_XmatsHom[5] - s_XmatsHom[0] - s_XmatsHom[10]) * 2;
-        quat[0] = (s_XmatsHom[8] - s_XmatsHom[2]) / S;
-        quat[1] = (s_XmatsHom[4] + s_XmatsHom[1]) / S;
-        quat[2] = 0.25 * S;
-        quat[3] = (s_XmatsHom[9] + s_XmatsHom[6]) / S;
-    }
-    else {
-        float S = sqrt(1.0 + s_XmatsHom[10] - s_XmatsHom[0] - s_XmatsHom[5]) * 2;
-        quat[0] = (s_XmatsHom[1] - s_XmatsHom[4]) / S;
-        quat[1] = (s_XmatsHom[8] + s_XmatsHom[2]) / S;
-        quat[2] = (s_XmatsHom[9] + s_XmatsHom[6]) / S;
-        quat[3] = 0.25 * S;
-    }
-}
+    T t;
+    T m00, m11, m22;
 
-template<typename T>
-__device__ void print_trans_mat(T* s_XmatsHom, int mat) {
-    if (threadIdx.x == 0) {
-        printf("Joint [%d]\n", mat);
-        for (int col = 0; col < 4; ++col) {
-            for (int row = 0; row < 4; ++row) {
-                int index = mat * 16 + col * 4 + row;
-                printf("%f(%d), ", s_XmatsHom[index], index);
-            }
-            printf("\n");
+    m00 = s_XmatsHom[0];
+    m11 = s_XmatsHom[5];
+    m22 = s_XmatsHom[10];
+    
+    if (m22 < 0) {
+        if (m00 > m11) {
+            t = 1 + m00 - m11 - m22;
+            quat[0] = t;
+            quat[1] = s_XmatsHom[4] + s_XmatsHom[1];
+            quat[2] = s_XmatsHom[2] + s_XmatsHom[8];
+            quat[3] = s_XmatsHom[9] - s_XmatsHom[6];
         }
-        printf("\n");
-    }
-}
-template<typename T>
-__device__ void compute_rotation_axis(T* q_joint, T* r) {
-    T w = q_joint[0];
-    T x = q_joint[1];
-    T y = q_joint[2];
-    T z = q_joint[3];
-
-    T sin_half_theta = sqrt(1.0 - w * w);
-
-    if (sin_half_theta > 1e-6) {
-        r[0] = x / sin_half_theta;
-        r[1] = y / sin_half_theta;
-        r[2] = z / sin_half_theta;
+        else {
+            t = 1 - m00 + m11 - m22;
+            quat[0] = s_XmatsHom[4] + s_XmatsHom[1];
+            quat[1] = t;
+            quat[2] = s_XmatsHom[9] + s_XmatsHom[6];
+            quat[3] = s_XmatsHom[2] - s_XmatsHom[8];
+        }
     }
     else {
-        r[0] = 1.0;
-        r[1] = 0.0;
-        r[2] = 0.0;
+        if (m00 < -m11) {
+            t = 1 - m00 - m11 + m22;
+            quat[0] = s_XmatsHom[2] + s_XmatsHom[8];
+            quat[1] = s_XmatsHom[9] + s_XmatsHom[6];
+            quat[2] = t;
+            quat[3] = s_XmatsHom[4] - s_XmatsHom[1];
+        }
+        else {
+            t = 1 + m00 + m11 + m22;
+            quat[0] = s_XmatsHom[9] - s_XmatsHom[6];
+            quat[1] = s_XmatsHom[2] - s_XmatsHom[8];
+            quat[2] = s_XmatsHom[4] - s_XmatsHom[1];
+            quat[3] = t;
+        }
     }
+    quat[0] *= 0.5 / sqrtf(t);
+    quat[1] *= 0.5 / sqrtf(t);
+    quat[2] *= 0.5 / sqrtf(t);
+    quat[3] *= 0.5 / sqrtf(t);
 }
 
-// q = wxyz
 template<typename T>
-__device__ void multiply_quat(T* q1, T* q2, T* q) {
-    q[0] = q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2] - q1[3] * q2[3];
-    q[1] = q1[0] * q2[1] + q1[1] * q2[0] + q1[3] * q2[2] - q1[2] * q2[3];
-    q[2] = q1[0] * q2[2] + q1[2] * q2[0] - q1[1] * q2[3] - q1[3] * q2[1];
-    q[3] = q1[0] * q2[3] + q1[3] * q2[0] + q1[1] * q2[2] - q1[2] * q2[1];
+__device__ void multiply_quat(T* r, T* s, T* t) {
+    t[0] = r[0] * s[0] - r[1] * s[1] - r[2] * s[2] - r[3] * s[3];
+    t[1] = r[0] * s[1] + r[1] * s[0] - r[2] * s[3] + r[3] * s[2];
+    t[2] = r[0] * s[2] + r[1] * s[3] + r[2] * s[0] - r[3] * s[1];
+    t[3] = r[0] * s[3] - r[1] * s[2] + r[2] * s[1] + r[3] * s[0];
 }
 
 // joint_pose = [x, y, z, roll, pitch, yaw]
@@ -170,7 +158,7 @@ __device__ void compute_X_inv(T* X, T* X_inv) {
     X_inv[5] = X[4];
     X_inv[6] = X[7];
     X_inv[7] = 0;
-    
+
     X_inv[8] = X[2];
     X_inv[9] = X[5];
     X_inv[10] = X[8];
@@ -264,6 +252,59 @@ __device__ void normalize_quat(T* quat) {
     }
 }
 
+template<typename T>
+__device__ void ryp_to_quat(T roll, T pitch, T yaw, T* q) {
+    T cr = cos(roll / 2), sr = sin(roll / 2);
+    T cp = cos(pitch / 2), sp = sin(pitch / 2);
+    T cy = cos(yaw / 2), sy = sin(yaw / 2);
+    q[0] = cr * cp * cy + sr * sp * sy;
+    q[1] = sr * cp * cy - cr * sp * sy;
+    q[2] = cr * sp * cy + sr * cp * sy;
+    q[3] = cr*cp*sy - sr*sp*cy;
+}
+
+/*
+template<typename T>
+__device__ void sample_joint_config(T* s_x, int local_problem, int global_problem) {
+    curandState state;
+    unsigned int seed = 1337;
+    curand_init(seed, global_problem, 0, &state);
+    //curand_init(clock64() + global_problem, threadIdx.x + blockIdx.x * blockDim.x, 0, &state);
+
+    int offset = local_problem * N;
+    for (int j = 0; j < N - 1; ++j) {
+        float r = curand_uniform(&state);
+        float low = -c_omega[j];
+        float high = c_omega[j];
+        s_x[offset + j] = static_cast<T>(low + r * (high - low));
+    }
+    s_x[offset + (N - 1)] = static_cast<T>(0.0);
+}
+*/
+
+template<typename T>
+__device__ void sample_joint_config(T* s_x, int local_problem, int global_problem) {
+    const int thread_id = threadIdx.x + threadIdx.y * blockDim.x + blockIdx.x * blockDim.x * blockDim.y;
+
+    // Use Philox RNG for better parallel distribution
+    curandStatePhilox4_32_10_t state;
+    curand_init(1337, thread_id, 0, &state);  // seed, subsequence, offset
+
+    int offset = local_problem * N;
+    for (int j = 0; j < N - 1; ++j) {
+        float r = curand_uniform(&state);  // returns in (0,1]
+        float low = -c_omega[j];
+        float high = c_omega[j];
+        s_x[offset + j] = static_cast<T>(low + r * (high - low));
+    }
+    s_x[offset + (N - 1)] = static_cast<T>(0.0);
+}
+
+template<typename T>
+__device__ __forceinline__ T clamp_val(T v, T lo, T hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
 // Global counter for solutions found
 __device__ int n_solutions = 0;
 
@@ -282,439 +323,753 @@ __global__ void globeik_kernel(
     const float nu,
     const int k_max) {
 
-    // IK problem threading
-    const int threads_per_problem = 2 * N;
-    int local_problem = threadIdx.x / threads_per_problem;
-    int local_thread = threadIdx.x % threads_per_problem;
-    int joint = (local_thread < N) ? local_thread : (local_thread - N);
+    const int tid = threadIdx.x;
+    const int local_problem = threadIdx.y;
+    const int global_problem = blockIdx.x * IK_PER_BLOCK + local_problem;
+    if (global_problem >= total_problems) return;
 
-    int global_problem = blockIdx.x * IK_PER_BLOCK + local_problem;
-    bool active = (global_problem < total_problems);
+    const bool is_pos = (tid < N);
+    const bool is_ori = (tid >= N && tid < 2 * N);
+    const int joint = is_pos ? tid : (tid - N);
 
-    bool is_pos_thread = (local_thread < N);
-    bool is_ori_thread = (local_thread >= N && local_thread < 2 * N);
-
-    // Declare shared memory arrays
-    __shared__ T s_x[IK_PER_BLOCK * N];
-    __shared__ T s_pose[IK_PER_BLOCK * 7];
-    __shared__ float s_pos_err[IK_PER_BLOCK * N];
-    __shared__ float s_ori_err[IK_PER_BLOCK * N];
+    __shared__ float s_x[IK_PER_BLOCK][N];
+    __shared__ float s_pose[IK_PER_BLOCK][7];
+    __shared__ float s_pos_err[IK_PER_BLOCK][N];
+    __shared__ float s_ori_err[IK_PER_BLOCK][N];
     __shared__ float s_glob_pos_err[IK_PER_BLOCK];
     __shared__ float s_glob_ori_err[IK_PER_BLOCK];
-    __shared__ T s_pos_theta[IK_PER_BLOCK * N];
-    __shared__ T s_ori_theta[IK_PER_BLOCK * N];
-    __shared__ T s_XmatsHom[IK_PER_BLOCK * N * 16];
-    __shared__ T s_jointXforms[IK_PER_BLOCK * N * 16];
+    __shared__ float s_pos_theta[IK_PER_BLOCK][N];
+    __shared__ float s_ori_theta[IK_PER_BLOCK][N];
+    __shared__ float s_XmatsHom[IK_PER_BLOCK][N * 16];
+    __shared__ float s_jointXforms[IK_PER_BLOCK][N * 16];
+
+    float* s_x_local = s_x[local_problem];
+    float* s_pose_local = s_pose[local_problem];
+    float* s_pos_err_local = s_pos_err[local_problem];
+    float* s_ori_err_local = s_ori_err[local_problem];
+    float* s_pos_theta_local = s_pos_theta[local_problem];
+    float* s_ori_theta_local = s_ori_theta[local_problem];
+    float* s_XmatsHom_local = s_XmatsHom[local_problem];
+    float* s_jointXforms_local = s_jointXforms[local_problem];
+
+    //const float* target_pose_local = &target_pose[global_problem * 7];
+    T target_pose_local[7];
+    target_pose_local[0] = target_pose[0];
+    target_pose_local[1] = target_pose[1];
+    target_pose_local[2] = target_pose[2];
+    target_pose_local[3] = target_pose[3];
+    target_pose_local[4] = target_pose[4];
+    target_pose_local[5] = target_pose[5];
+    target_pose_local[6] = target_pose[6];
+
+    if (tid == 0) {
+        sample_joint_config<float>(s_x_local, 0, global_problem);
+        for (int j = 0; j < N; ++j) {
+            s_pos_theta_local[j] = s_ori_theta_local[j] = 0;
+        }
+    }
+
+    for (int i = tid; i < N * 16; i += blockDim.x) {
+        s_XmatsHom_local[i] = d_robotModel->d_XImats[i + 504];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        grid::update_singleJointX(s_jointXforms_local, s_XmatsHom_local, s_x_local, N - 1);
+
+        float fx = s_jointXforms_local[(N - 1) * 16 + 12];
+        float fy = s_jointXforms_local[(N - 1) * 16 + 13];
+        float fz = s_jointXforms_local[(N - 1) * 16 + 14];
+
+        float q_ee[4];
+        mat_to_quat(&s_jointXforms_local[(N - 1) * 16], q_ee);
+        normalize_quat(q_ee);
+
+        float q_t[4] = {
+            target_pose_local[3], target_pose_local[4],
+            target_pose_local[5], target_pose_local[6]
+        };
+
+        float q_ee_conj[4] = { q_ee[0], -q_ee[1], -q_ee[2], -q_ee[3] };
+        float q_err[4];
+        multiply_quat(q_t, q_ee_conj, q_err);
+        normalize_quat(q_err);
+
+        float pos_err = sqrtf((fx - target_pose_local[0]) * (fx - target_pose_local[0]) +
+            (fy - target_pose_local[1]) * (fy - target_pose_local[1]) +
+            (fz - target_pose_local[2]) * (fz - target_pose_local[2]));
+
+        float ori_err = 2.0f * acosf(q_err[0]);
+
+        s_glob_pos_err[local_problem] = pos_err;
+        s_glob_ori_err[local_problem] = ori_err;
+
+        s_pose_local[0] = fx;
+        s_pose_local[1] = fy;
+        s_pose_local[2] = fz;
+        s_pose_local[3] = q_ee[0];
+        s_pose_local[4] = q_ee[1];
+        s_pose_local[5] = q_ee[2];
+        s_pose_local[6] = q_ee[3];
+
+        for (int j = 0; j < N; ++j) {
+            s_pos_err_local[j] = pos_err;
+            s_ori_err_local[j] = ori_err;
+        }
+    }
+    __syncthreads();
     
-    // Load joint configs into shared memory
-    if (active && (joint < N)) {
-        s_x[local_problem * N + joint] = x[global_problem * N + joint];
-        s_pos_theta[local_problem * N + joint] = 0;
-        s_ori_theta[local_problem * N + joint] = 0;
-    }
-
-    // Load robot model matrices
-    int total_elems = IK_PER_BLOCK * (N * 16);
-    for (int ind = threadIdx.x; ind < total_elems; ind += blockDim.x) {
-        int local_ind = ind % (N * 16);
-        s_XmatsHom[ind] = d_robotModel->d_XImats[local_ind + 504];
-    }
-    __syncthreads();
-
-    // Shrink from global to local grouping
-    // Compute errors for sample
-    grid::update_singleJointX(
-        &s_jointXforms[local_problem * (N * 16)],
-        &s_XmatsHom[local_problem * (N * 16)],
-        &s_x[local_problem * N],
-        N - 1
-    );
-    __syncthreads();
-
-    int pose_offset = local_problem * 7;
-    int xf_offset = local_problem * (N * 16);
-    s_pose[pose_offset + 0] = s_jointXforms[xf_offset + 6 * 16 + 12];
-    s_pose[pose_offset + 1] = s_jointXforms[xf_offset + 6 * 16 + 13];
-    s_pose[pose_offset + 2] = s_jointXforms[xf_offset + 6 * 16 + 14];
-
-    T dd0 = s_pose[pose_offset + 0] - target_pose[0];
-    T dd1 = s_pose[pose_offset + 1] - target_pose[1];
-    T dd2 = s_pose[pose_offset + 2] - target_pose[2];
-    T initial_err = sqrtf(dd0 * dd0 + dd1 * dd1 + dd2 * dd2);
-
-    T quat[4];
-    mat_to_quat(&s_jointXforms[xf_offset + 6 * 16], quat);
-    normalize_quat(quat);
-
-    float quat_dot = fabsf(quat[0] * target_pose[3] +
-        quat[1] * target_pose[4] +
-        quat[2] * target_pose[5] +
-        quat[3] * target_pose[6]);
-    // Clamp the dot product to [-1,1] for safety.
-    quat_dot = fminf(fmaxf(quat_dot, -1.0f), 1.0f);
-
-    float initial_ori_err = 2.0f * acosf(quat_dot) * (180.0f / 3.14159265f);
-    ori_errors[global_problem] = initial_ori_err;
-
-    pos_errors[global_problem] = initial_err;
-    //ori_errors[global_problem] = 1e6f;
-    if (initial_err > gamma) {
-    //if (initial_err > 0.1){// * 1.25 && initial_ori_err > nu) {
-        return;
-    }
-
-    // Coordinate Descent Loop
-    int k = 0; 
-    int prev_joint = N;
-    float prev_pos_err = initial_err;
-    float prev_ori_err = initial_ori_err;
-    int x_offset = local_problem * N;
-
-    while (k < k_max) {
-        if (is_pos_thread) {
-            grid::update_singleJointX(
-                &s_jointXforms[xf_offset],
-                &s_XmatsHom[xf_offset],
-                &s_x[x_offset],
-                joint
-            );
+    for (int k = 0; k < k_max; ++k) {
+        if (tid == 0) {
+            grid::update_singleJointX(s_jointXforms_local, s_XmatsHom_local, s_x_local, N - 1);
         }
         __syncthreads();
 
-        if (is_pos_thread) {
-            T joint_pos[3], r[3];
+        if (is_pos) {
+            T joint_pos[3] = {
+                s_jointXforms_local[joint * 16 + 12],
+                s_jointXforms_local[joint * 16 + 13],
+                s_jointXforms_local[joint * 16 + 14]
+            };
 
-            // Compute u, v, r
-            joint_pos[0] = s_jointXforms[xf_offset + joint * 16 + 12];
-            joint_pos[1] = s_jointXforms[xf_offset + joint * 16 + 13];
-            joint_pos[2] = s_jointXforms[xf_offset + joint * 16 + 14];
-            r[0] = s_jointXforms[xf_offset + joint * 16 + 8];
-            r[1] = s_jointXforms[xf_offset + joint * 16 + 9];
-            r[2] = s_jointXforms[xf_offset + joint * 16 + 10];
+            T r[3] = {
+                s_jointXforms_local[joint * 16 + 8],
+                s_jointXforms_local[joint * 16 + 9],
+                s_jointXforms_local[joint * 16 + 10]
+            };
 
-            T u0 = s_pose[pose_offset + 0] - joint_pos[0];
-            T u1 = s_pose[pose_offset + 1] - joint_pos[1];
-            T u2 = s_pose[pose_offset + 2] - joint_pos[2];
+            T tr = s_jointXforms_local[joint * 16 + 0]
+                + s_jointXforms_local[joint * 16 + 5]
+                + s_jointXforms_local[joint * 16 + 10];
 
-            T v0 = target_pose[0] - joint_pos[0];
-            T v1 = target_pose[1] - joint_pos[1];
-            T v2 = target_pose[2] - joint_pos[2];
+            T r_n = 2.0f * sinf(acosf((tr - 1) / 2.0f));
+            r[0] /= r_n; r[1] /= r_n; r[2] /= r_n;
 
-            T u_r = u0 * r[0] + u1 * r[1] + u2 * r[2];
-            T v_r = v0 * r[0] + v1 * r[1] + v2 * r[2];
-            T uproj0 = u0 - u_r * r[0];
-            T uproj1 = u1 - u_r * r[1];
-            T uproj2 = u2 - u_r * r[2];
-            T vproj0 = v0 - v_r * r[0];
-            T vproj1 = v1 - v_r * r[1];
-            T vproj2 = v2 - v_r * r[2];
-            T uproj_norm = sqrtf(uproj0 * uproj0 + uproj1 * uproj1 + uproj2 * uproj2);
-            T vproj_norm = sqrtf(vproj0 * vproj0 + vproj1 * vproj1 + vproj2 * vproj2);
+            T u[3] = {
+                s_pose_local[0] - joint_pos[0],
+                s_pose_local[1] - joint_pos[1],
+                s_pose_local[2] - joint_pos[2]
+            };
+
+            T v[3] = {
+                target_pose_local[0] - joint_pos[0],
+                target_pose_local[1] - joint_pos[1],
+                target_pose_local[2] - joint_pos[2]
+            };
+
+            T dot_u_r = u[0] * r[0] + u[1] * r[1] + u[2] * r[2];
+            T dot_v_r = v[0] * r[0] + v[1] * r[1] + v[2] * r[2];
+            T uproj[3] = { u[0] - dot_u_r * r[0],
+                            u[1] - dot_u_r * r[1],
+                            u[2] - dot_u_r * r[2] };
+            T vproj[3] = { v[0] - dot_v_r * r[0],
+                            v[1] - dot_v_r * r[1],
+                            v[2] - dot_v_r * r[2] };
+
+            T uproj_norm = sqrtf(
+                uproj[0] * uproj[0] +
+                uproj[1] * uproj[1] +
+                uproj[2] * uproj[2]);
+            T vproj_norm = sqrtf(
+                vproj[0] * vproj[0] +
+                vproj[1] * vproj[1] +
+                vproj[2] * vproj[2]);
             if (uproj_norm > 1e-6) {
-                uproj0 /= uproj_norm; uproj1 /= uproj_norm; uproj2 /= uproj_norm;
+                uproj[0] /= uproj_norm; uproj[1] /= uproj_norm; uproj[2] /= uproj_norm;
             }
             if (vproj_norm > 1e-6) {
-                vproj0 /= vproj_norm; vproj1 /= vproj_norm; vproj2 /= vproj_norm;
+                vproj[0] /= vproj_norm; vproj[1] /= vproj_norm; vproj[2] /= vproj_norm;
             }
 
-            T dotp = uproj0 * vproj0 + uproj1 * vproj1 + uproj2 * vproj2;
+            T dotp = uproj[0] * vproj[0] + uproj[1] * vproj[1] + uproj[2] * vproj[2];
             dotp = min(max(dotp, -1.0f), 1.0f);
             T theta = acos(dotp);
 
-            T err_x = s_pose[pose_offset + 0] - target_pose[0];
-            T err_y = s_pose[pose_offset + 1] - target_pose[1];
-            T err_z = s_pose[pose_offset + 2] - target_pose[2];
+            T cx = uproj[1] * vproj[2] - uproj[2] * vproj[1];
+            T cy = uproj[2] * vproj[0] - uproj[0] * vproj[2];
+            T cz = uproj[0] * vproj[1] - uproj[1] * vproj[0];
 
-            T d = err_x * r[0] + err_y * r[1] + err_z * r[2];
-            T sign_update = (d > 0) ? -1.0f : 1.0f;
-            T delta = 1.0f;
-            T theta_update = sign_update * theta * delta;
+            T sign = r[0] * cx + r[1] * cy + r[2] * cz;
+            if (sign < 0)
+                theta = -theta;
 
-            int pos_theta_offset = local_problem * N;
-            s_pos_theta[pos_theta_offset + joint] += theta_update;
+            // Scaling
+            T delta = 0.75f + 0.25f * logf((float)(k + 1)) / logf((float)k_max);
+            //T delta = 0.75f;
+            theta *= delta;
 
-            T candidate[N];
-            for (int i = 0; i < N; ++i) {
-                candidate[i] = (i == joint) ? s_x[x_offset + i] + theta_update : s_x[x_offset + i];
+            T cand[N];
+            for (int j = 0; j < N; ++j) {
+                cand[j] = (j == joint) ? clamp_val(s_x_local[j] + theta, -c_omega[j], c_omega[j]) : s_x_local[j];
             }
 
-            T candidate_jointX[N * 16];
+            T CjX[N * 16];
             T candidate_XmatsHom[N * 16];
-#pragma unroll
-            for (int i = 0; i < N * 16; ++i) {
-                candidate_XmatsHom[i] = s_XmatsHom[xf_offset + i];
-            }
-            grid::update_singleJointX(
-                candidate_jointX,
-                candidate_XmatsHom,
-                candidate,
-                N - 1
+            memcpy(candidate_XmatsHom, s_XmatsHom_local, N * 16 * sizeof(T));
+
+            grid::update_singleJointX(CjX, candidate_XmatsHom, cand, N - 1);
+            T ex = CjX[(N - 1) * 16 + 12];
+            T ey = CjX[(N - 1) * 16 + 13];
+            T ez = CjX[(N - 1) * 16 + 14];
+            s_pos_theta_local[joint] = theta;
+
+            s_pos_err_local[joint] = sqrtf(
+                (ex - target_pose_local[0]) * (ex - target_pose_local[0]) +
+                (ey - target_pose_local[1]) * (ey - target_pose_local[1]) +
+                (ez - target_pose_local[2]) * (ez - target_pose_local[2])
             );
-
-            // Calculate candidate error
-            T candidate_ee[3];
-            candidate_ee[0] = candidate_jointX[6 * 16 + 12];
-            candidate_ee[1] = candidate_jointX[6 * 16 + 13];
-            candidate_ee[2] = candidate_jointX[6 * 16 + 14];
-
-            T dd0 = candidate_ee[0] - target_pose[0];
-            T dd1 = candidate_ee[1] - target_pose[1];
-            T dd2 = candidate_ee[2] - target_pose[2];
-            T cand_err = sqrt(dd0 * dd0 + dd1 * dd1 + dd2 * dd2);
-            int pos_err_offset = local_problem * N;
-            s_pos_err[pos_err_offset + joint] = cand_err;
         }
 
-        if (is_ori_thread) {
-            T q_joint[4], r[3];
-            xf_offset = local_problem * (N * 16);
-            x_offset = local_problem * N;
+        if (is_ori) {
+            T r[3] = {
+                s_jointXforms_local[joint * 16 + 6] - s_jointXforms_local[joint * 16 + 9],
+                s_jointXforms_local[joint * 16 + 8] - s_jointXforms_local[joint * 16 + 2],
+                s_jointXforms_local[joint * 16 + 1] - s_jointXforms_local[joint * 16 + 4]
+            };
 
-            // Compute rotation axis
-            r[0] = s_jointXforms[xf_offset + joint * 16 + 8];
-            r[1] = s_jointXforms[xf_offset + joint * 16 + 9];
-            r[2] = s_jointXforms[xf_offset + joint * 16 + 10];
+            T tr = s_jointXforms_local[joint * 16 + 0]
+                + s_jointXforms_local[joint * 16 + 5]
+                + s_jointXforms_local[joint * 16 + 10];
 
-            // Calculate quaternion for joint
-            mat_to_quat(&s_jointXforms[joint * 16], q_joint);
-            normalize_quat(q_joint);
+            T r_n = 2.0f * sinf(acosf((tr - 1) / 2.0f));
+            r[0] /= r_n; r[1] /= r_n; r[2] /= r_n;
 
-            // Get transformation between joint & goal
-            // Get ee transformation matrix
-            T X_ee[16];
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                X_ee[i] = s_jointXforms[xf_offset + joint * 16 + i];
-            }
+            T q_ee[4];
+            mat_to_quat(&s_jointXforms_local[(N - 1) * 16], q_ee);
+            normalize_quat(q_ee);
 
-            // Get goal transformation matrix
-            T X_goal[16];
-            xyzpry_to_X((T*)target_pose, X_goal);
+            T q_t[4] = {
+                target_pose_local[3], target_pose_local[4],
+                target_pose_local[5], target_pose_local[6]
+            };
 
-            T X_ee_inv[16];
-            compute_X_inv(X_ee, X_ee_inv);
-
-            T X_ee_goal[16];
-            mat_mult(X_ee_inv, X_goal, X_ee_goal);
-
-            T q_ee_goal[4];
-            mat_to_quat(X_ee_goal, q_ee_goal);
-            normalize_quat(q_ee_goal);
-
-            // Get rotation component and project onto rotation axis
-            T axis[3];
-            axis[0] = q_ee_goal[1]; axis[1] = q_ee_goal[2]; axis[2] = q_ee_goal[3];
-
-            T proj[3];
-            vec_projection(axis, r, proj);
-
-            // Get twist and normalize
-            T q_twist[4];
-            q_twist[0] = q_ee_goal[0]; q_twist[1] = proj[0]; q_twist[2] = proj[1]; q_twist[3] = proj[2];
-
-            T q_twist_norm = 0;
-            for (int i = 0; i < 4; ++i) {
-                q_twist_norm += q_twist[i] * q_twist[i];
-            }
-            q_twist_norm = sqrt(q_twist_norm);
-            if (q_twist_norm > 1e-6) {
-                for (int i = 0; i < 4; ++i) {
-                    q_twist[i] /= q_twist_norm;
-                }
-            }
-
-            // Do conjugate and multiply
-            q_twist[1] = -q_twist[1]; q_twist[2] = -q_twist[2]; q_twist[3] = -q_twist[3];
-            T q_d[4];
-            multiply_quat(q_twist, q_joint, q_d);
-            normalize_quat(q_d);
-
-            T q_curr_inv[4] = { q_joint[0], -q_joint[1], -q_joint[2], -q_joint[3] };
+            T q_ee_inv[4] = { q_ee[0], -q_ee[1], -q_ee[2], -q_ee[3] };
             T q_err[4];
-            multiply_quat(q_ee_goal, q_curr_inv, q_err);
+            multiply_quat(q_t, q_ee_inv, q_err);
             normalize_quat(q_err);
 
-            T angle_err = 2.0f * acosf(fminf(fmaxf(q_err[0], -1.0f), 1.0f));
-            T sin_half_angle = sqrtf(1.0f - q_err[0] * q_err[0]);
-            T axis_proj = (sin_half_angle > 1e-6f) ? (q_err[1] * r[0] + q_err[2] * r[1] + q_err[3] * r[2]) / sin_half_angle : 0.0f;
-
-            T sign_update = (axis_proj >= 0) ? 1.0f : -1.0f;
-            T scale_factor = fminf(0.5f, angle_err);
-            T theta_update = scale_factor * sign_update * angle_err;
-
-            int ori_theta_offset = local_problem * N;
-            s_ori_theta[ori_theta_offset + joint] += theta_update;
-
-            // Create candidate joint update
-            T candidate_joint = s_x[x_offset + joint] + theta_update;
-            joint_limits(&candidate_joint, joint);
-
-            T candidate[N];
-#pragma unroll
-            for (int i = 0; i < N; i++) {
-                candidate[i] = (i == joint) ? candidate_joint : s_x[x_offset + i];
+            T phi = 2.0f * acosf(q_err[0]);
+            T sin_h = sinf(phi / 2.0f);
+            T a[3] = { 1, 0, 0 };
+            if (sin_h > 1e-6f) {
+                a[0] = q_err[1] / sin_h;
+                a[1] = q_err[2] / sin_h;
+                a[2] = q_err[3] / sin_h;
             }
 
-            T candidate_jointX[N * 16];
-            T candidate_XmatsHom[N * 16];
-#pragma unroll
-            for (int i = 0; i < N * 16; ++i) {
-                candidate_XmatsHom[i] = s_XmatsHom[xf_offset + i];
+            T sign = a[0] * r[0] + a[1] * r[1] + a[2] * r[2];
+            T delta = 0.75f + 0.25f * logf((float)(k + 1)) / logf((float)k_max);
+            //T delta = 0.75f;
+            T theta_update = (sign < 0 ? -phi : phi) * delta;
+            s_ori_theta_local[joint] = theta_update;
+
+            T cand[N];
+            for (int j = 0; j < N; ++j) {
+                cand[j] = (j == joint) ? clamp_val(s_x_local[j] + theta_update, -c_omega[j], c_omega[j]) : s_x_local[j];
             }
-            grid::update_singleJointX(
-                candidate_jointX,
-                candidate_XmatsHom,
-                candidate,
-                N - 1
-            );
 
-            T candidate_quat[4];
-            mat_to_quat(&candidate_jointX[16 * 6], candidate_quat);
-            normalize_quat(candidate_quat);
+            T CX[N * 16];
+            memcpy(CX, s_XmatsHom_local, sizeof(CX));
+            grid::update_singleJointX(CX, CX, cand, N - 1);
+            T qc[4];
+            mat_to_quat(&CX[6 * 16], qc);
+            normalize_quat(qc);
+            T dotp = qc[0] * q_t[0] + qc[1] * q_t[1] + qc[2] * q_t[2] + qc[3] * q_t[3];
+            dotp = fminf(fmaxf(dotp, -1.0f), 1.0f);
 
-            T quat_dot = fabsf(candidate_quat[0] * target_pose[3] + 
-                candidate_quat[1] * target_pose[4] + 
-                candidate_quat[2] * target_pose[5] + 
-                candidate_quat[3] * target_pose[6]);
-            quat_dot = fminf(fmaxf(quat_dot, -1.0f), 1.0f);
-            T ori_err_deg = 2.0f * acosf(quat_dot) * (180.0f / 3.14159265f);
-
-            int ori_err_offset = local_problem * N;
-            s_ori_err[ori_err_offset + joint] = ori_err_deg;
+            s_ori_err_local[joint] = 2.0f * acosf(dotp);
         }
         __syncthreads();
 
-        if (local_thread == 0) {
-            int pos_base = local_problem * N;
-            int ori_base = local_problem * N;
-            float best_pos_err = s_pos_err[pos_base];
-            float best_ori_err = s_ori_err[ori_base];
-            int best_pos_joint = 0;
-            int best_ori_joint = 0;
-
+        if (tid == 0) {
+            int best_j_pos = 0;
+            int best_j_ori = 0;
+            float best_pos_err = s_pos_err_local[0];
+            float best_ori_err = s_ori_err_local[0];
             for (int j = 1; j < N; ++j) {
-                float curr_pos_err = s_pos_err[pos_base + j];
-                float curr_ori_err = s_ori_err[ori_base + j];
-                if (curr_pos_err < best_pos_err) {
-                    best_pos_err = curr_pos_err;
-                    best_pos_joint = j;
+                if (s_pos_err_local[j] < best_pos_err) {
+                    best_j_pos = j;
+                    best_pos_err = s_pos_err_local[j];
                 }
-                if (curr_ori_err < best_ori_err) {
-                    best_ori_err = curr_ori_err;
-                    best_ori_joint = j;
+                if (s_ori_err_local[j] < best_ori_err) {
+                    best_j_ori = j;
+                    best_ori_err = s_ori_err_local[j];
                 }
             }
 
-            // Decide whether to update based on position or orientation
-            bool is_pos_update = (s_glob_pos_err[local_problem] / epsilon > s_glob_ori_err[local_problem] / nu);
-            //is_pos_update = (k % 2 == 0);
-            if (is_pos_update) {
-                T new_theta = s_x[x_offset + best_pos_joint] + s_pos_theta[pos_base + best_pos_joint];
-                joint_limits(&new_theta, best_pos_joint);
-
-                s_x[x_offset + best_pos_joint] = new_theta;
-                s_glob_pos_err[local_problem] = best_pos_err;
-                prev_joint = best_pos_joint;
+            if (best_j_pos != best_j_ori) {
+                s_x_local[best_j_pos] += s_pos_theta_local[best_j_pos];
+                s_x_local[best_j_ori] += s_ori_theta_local[best_j_ori];
             }
             else {
-                T new_theta = s_x[x_offset + best_ori_joint] + s_ori_theta[ori_base + best_ori_joint];
-                joint_limits(&new_theta, best_ori_joint);
-
-                s_x[x_offset + best_ori_joint] = new_theta;
-                s_glob_ori_err[local_problem] = best_ori_err;
-                prev_joint = best_ori_joint;
+                if (s_glob_pos_err[local_problem] > s_glob_ori_err[local_problem]) {
+                    s_x_local[best_j_pos] += s_pos_theta_local[best_j_pos];
+                }
+                else {
+                    s_x_local[best_j_ori] += s_ori_theta_local[best_j_ori];
+                }
             }
-
-            prev_pos_err = best_pos_err;
-            prev_ori_err = best_ori_err;
             for (int j = 0; j < N; ++j) {
-                s_pos_theta[pos_base + j] = 0.0;
-                s_ori_theta[ori_base + j] = 0.0;
+                s_pos_theta_local[j] = s_ori_theta_local[j] = 0;
             }
         }
         __syncthreads();
 
-        grid::update_singleJointX(
-            &s_jointXforms[xf_offset],
-            &s_XmatsHom[xf_offset],
-            &s_x[x_offset],
-            N - 1
-        );
-        __syncthreads();
+        if (tid == 0) {
+            grid::update_singleJointX(s_jointXforms_local, s_XmatsHom_local, s_x_local, N - 1);
 
-        if (local_thread == 0) {
-            int pose_offset = local_problem * 7;
-            s_pose[pose_offset + 0] = s_jointXforms[xf_offset + 16 * 6 + 12];
-            s_pose[pose_offset + 1] = s_jointXforms[xf_offset + 16 * 6 + 13];
-            s_pose[pose_offset + 2] = s_jointXforms[xf_offset + 16 * 6 + 14];
+            float fx = s_jointXforms_local[(N - 1) * 16 + 12];
+            float fy = s_jointXforms_local[(N - 1) * 16 + 13];
+            float fz = s_jointXforms_local[(N - 1) * 16 + 14];
 
-            T quat[4];
-            mat_to_quat(&s_jointXforms[xf_offset + 16 * 6], quat);
-            normalize_quat(quat);
+            T fq[4];
+            mat_to_quat(&s_jointXforms_local[(N - 1) * 16], fq);
+            normalize_quat(fq);
 
-            s_pose[pose_offset + 3] = quat[0];
-            s_pose[pose_offset + 4] = quat[1];
-            s_pose[pose_offset + 5] = quat[2];
-            s_pose[pose_offset + 6] = quat[3];
+            s_pose_local[0] = fx;
+            s_pose_local[1] = fy;
+            s_pose_local[2] = fz;
+            s_pose_local[3] = fq[0];
+            s_pose_local[4] = fq[1];
+            s_pose_local[5] = fq[2];
+            s_pose_local[6] = fq[3];
 
-            T d0 = s_jointXforms[xf_offset + 16 * 6 + 12] - target_pose[0];
-            T d1 = s_jointXforms[xf_offset + 16 * 6 + 13] - target_pose[1];
-            T d2 = s_jointXforms[xf_offset + 16 * 6 + 14] - target_pose[2];
-            s_glob_pos_err[local_problem] = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+            T pos_err = sqrtf(
+                (target_pose_local[0] - fx) * (target_pose_local[0] - fx) +
+                (target_pose_local[1] - fy) * (target_pose_local[1] - fy) +
+                (target_pose_local[2] - fz) * (target_pose_local[2] - fz)
+            );
+            
+            s_glob_pos_err[local_problem] = pos_err;
 
-            T quat_dot = fabsf(s_pose[pose_offset + 3] * target_pose[3] + 
-                s_pose[pose_offset + 4] * target_pose[4] + 
-                s_pose[pose_offset + 5] * target_pose[5] + 
-                s_pose[pose_offset + 6] * target_pose[6]);
-            quat_dot = fminf(fmaxf(quat_dot, -1.0f), 1.0f);
-            T ori_err_deg = 2.0f * acosf(quat_dot) * (180.0f / 3.14159265f);
-            s_glob_ori_err[local_problem] = ori_err_deg;
+            T q_t[4] = {
+                target_pose_local[3], target_pose_local[4],
+                target_pose_local[5], target_pose_local[6]
+            };
+
+            T q_ee_inv[4] = { fq[0], -fq[1], -fq[2], -fq[3] };
+            T q_err[4];
+            multiply_quat(q_t, q_ee_inv, q_err);
+            normalize_quat(q_err);
+
+            s_glob_ori_err[local_problem] = 2.0f * acosf(q_err[0]);
         }
-        k++;
         __syncthreads();
 
-        if (local_thread == 0 && s_glob_pos_err[local_problem] < epsilon && s_glob_ori_err[local_problem] < nu) {
+        if (s_glob_pos_err[local_problem] < epsilon && s_glob_ori_err[local_problem] < nu) {
             atomicAdd(&n_solutions, 1);
-        }
-        __syncthreads();
-
-        if ((s_glob_pos_err[local_problem] < epsilon && s_glob_ori_err[local_problem] < nu) || n_solutions >= num_solutions) {
             break;
         }
+        if (n_solutions >= num_solutions) {
+            break;
+        }
+        __syncthreads();
     }
 
-    if (active) {
-        int x_offset = local_problem * N;
-        int pose_offset = local_problem * 7;
-        for (int i = 0; i < N; ++i) {
-            x[global_problem * N + i] = s_x[x_offset + i];
-        }
-        for (int i = 0; i < 7; ++i) {
-            pose[global_problem * 7 + i] = s_pose[pose_offset + i];
-        }
-        pos_errors[global_problem] = s_glob_pos_err[local_problem];
-        ori_errors[global_problem] = s_glob_ori_err[local_problem];
+    if (tid < N)
+        x[global_problem * N + tid] = s_x_local[tid];
+    if (tid < 7)
+        pose[global_problem * 7 + tid] = s_pose_local[tid];
+    if (tid == 0) {
+        pos_errors[global_problem] = s_glob_pos_err[local_problem] * 1000.0f;
+        ori_errors[global_problem] = s_glob_ori_err[local_problem] * (180.0f / PI);
     }
 }
 
+/*
 template<typename T>
-void sample_joint_configs_range(T* x, const float* omega, int start, int end) {
-    std::mt19937 gen(0);
+__global__ void globeik_kernel(
+    T* __restrict__ x,
+    T* __restrict__ pose,
+    const T* __restrict__ target_pose,
+    float* __restrict__ pos_errors,
+    float* __restrict__ ori_errors,
+    int num_solutions,
+    int total_problems,
+    const grid::robotModel<T>* d_robotModel,
+    const float epsilon,
+    const float gamma,
+    const float nu,
+    const int k_max) {
+
+    // IK problem threading
+    int P = blockIdx.x; 
+    //if (P >= total_problems) return;
+
+    int tid = threadIdx.x;
+    bool is_pos = (tid < N);
+    bool is_ori = (tid < 2 * N && tid >= N);
+    int joint = is_pos ? tid : (tid - N);
+
+    // Declare shared memory arrays
+    __shared__ T s_x[N];
+    __shared__ T s_pose[7];
+    __shared__ float s_pos_err[N], s_ori_err[N];
+    __shared__ float s_glob_pos_err, s_glob_ori_err;
+    __shared__ T s_pos_theta[N], s_ori_theta[N];
+    __shared__ T s_XmatsHom[N * 16], s_jointXforms[N * 16];
+
+    // Sample initial configuration
+    if (joint == 0) {
+        sample_joint_config<T>(s_x, 0, P);
+        for (int j = 0; j < N; ++j) {
+            s_pos_theta[j] = s_ori_theta[j] = 0;
+        }
+    }
+
+    // Load robot model matrices
+    for (int i = tid; i < N * 16; i += blockDim.x) {
+        s_XmatsHom[i] = d_robotModel->d_XImats[i + 504];
+    }
+    __syncthreads();
+
+    if (joint == 0) {
+        grid::update_singleJointX(s_jointXforms, s_XmatsHom, s_x, N - 1);
+
+        T px = s_jointXforms[(N - 1) * 16 + 12];
+        T py = s_jointXforms[(N - 1) * 16 + 13];
+        T pz = s_jointXforms[(N - 1) * 16 + 14];
+        s_glob_pos_err = sqrtf(
+            (px - target_pose[0]) * (px - target_pose[0]) +
+            (py - target_pose[1]) * (py - target_pose[1]) +
+            (pz - target_pose[2]) * (pz - target_pose[2])
+        );
+
+        T q_ee[4];
+        mat_to_quat(&s_jointXforms[6 * 16], q_ee);
+        normalize_quat(q_ee);
+
+        T q_t[4] = { target_pose[3],
+                     target_pose[4],
+                     target_pose[5],
+                     target_pose[6] };
+        
+        T q_err[4];
+        T q_ee_conj[4] = { q_ee[0], -q_ee[1], -q_ee[2], -q_ee[3] };
+        multiply_quat(q_t, q_ee_conj, q_err);
+        normalize_quat(q_err);
+        s_glob_ori_err = 2.0f * acosf(q_err[0]);
+
+        for (int j = 0; j < N; ++j) {
+            s_pos_err[j] = s_glob_pos_err;
+            s_ori_err[j] = s_glob_ori_err;
+        }
+
+        s_pose[0] = px;
+        s_pose[1] = py;
+        s_pose[2] = pz;
+        s_pose[3] = q_ee[0];
+        s_pose[4] = q_ee[1];
+        s_pose[5] = q_ee[2];
+        s_pose[6] = q_ee[3];
+    }
+    __syncthreads();
+
+    // Coordinate Descent Loop
+    for (int k = 0; k < k_max; ++k) {
+        if (tid == 0) {
+            grid::update_singleJointX(s_jointXforms, s_XmatsHom, s_x, N - 1);
+        }
+        __syncthreads();
+
+        if (is_pos) {
+            T joint_pos[3] = {
+                s_jointXforms[joint * 16 + 12],
+                s_jointXforms[joint * 16 + 13],
+                s_jointXforms[joint * 16 + 14]
+            };
+
+            T r[3] = {
+                s_jointXforms[joint * 16 + 8],
+                s_jointXforms[joint * 16 + 9],
+                s_jointXforms[joint * 16 + 10]
+            };
+
+            T tr = s_jointXforms[joint * 16 + 0]
+                + s_jointXforms[joint * 16 + 5]
+                + s_jointXforms[joint * 16 + 10];
+
+            T r_n = 2.0f * sinf(acosf((tr - 1) / 2.0f));
+            r[0] /= r_n; r[1] /= r_n; r[2] /= r_n;
+
+            T u[3] = {
+                s_pose[0] - joint_pos[0],
+                s_pose[1] - joint_pos[1],
+                s_pose[2] - joint_pos[2]
+            };
+
+            T v[3] = {
+                target_pose[0] - joint_pos[0],
+                target_pose[1] - joint_pos[1],
+                target_pose[2] - joint_pos[2]
+            };
+
+            T dot_u_r = u[0] * r[0] + u[1] * r[1] + u[2] * r[2];
+            T dot_v_r = v[0] * r[0] + v[1] * r[1] + v[2] * r[2];
+            T uproj[3] = { u[0] - dot_u_r * r[0],
+                           u[1] - dot_u_r * r[1],
+                           u[2] - dot_u_r * r[2] };
+            T vproj[3] = { v[0] - dot_v_r * r[0],
+                           v[1] - dot_v_r * r[1],
+                           v[2] - dot_v_r * r[2] };
+
+            T uproj_norm = sqrtf(
+                uproj[0] * uproj[0] +
+                uproj[1] * uproj[1] +
+                uproj[2] * uproj[2]);
+            T vproj_norm = sqrtf(
+                vproj[0] * vproj[0] +
+                vproj[1] * vproj[1] +
+                vproj[2] * vproj[2]);
+            if (uproj_norm > 1e-6) {  
+                uproj[0] /= uproj_norm; uproj[1] /= uproj_norm; uproj[2] /= uproj_norm;
+            }
+            if (vproj_norm > 1e-6) {
+                vproj[0] /= vproj_norm; vproj[1] /= vproj_norm; vproj[2] /= vproj_norm;
+            }
+
+            T dotp = uproj[0] * vproj[0] + uproj[1] * vproj[1] + uproj[2] * vproj[2];
+            dotp = min(max(dotp, -1.0f), 1.0f);
+            T theta = acos(dotp);
+
+            T cx = uproj[1] * vproj[2] - uproj[2] * vproj[1];
+            T cy = uproj[2] * vproj[0] - uproj[0] * vproj[2];
+            T cz = uproj[0] * vproj[1] - uproj[1] * vproj[0];
+
+            T sign = r[0] * cx + r[1] * cy + r[2] * cz;
+            if (sign < 0)
+                theta = -theta;
+
+            // Scaling
+            T delta = 0.75f + 0.25f * logf((float)(k + 1)) / logf((float)k_max);
+            //T delta = 0.75f;
+            theta *= delta;
+
+            T cand[N];
+            for (int j = 0; j < N; ++j) {
+                cand[j] = (j == joint) ? clamp_val(s_x[j] + theta, -c_omega[j], c_omega[j]) : s_x[j];
+            }
+
+            T CjX[N * 16];
+            T candidate_XmatsHom[N * 16];
+            memcpy(candidate_XmatsHom, s_XmatsHom, N * 16 * sizeof(T));
+
+            grid::update_singleJointX(CjX, candidate_XmatsHom, cand, N - 1);
+            T ex = CjX[6 * 16 + 12];
+            T ey = CjX[6 * 16 + 13];
+            T ez = CjX[6 * 16 + 14];
+            s_pos_theta[joint] = theta;
+
+            s_pos_err[joint] = sqrtf(
+                (ex - target_pose[0]) * (ex - target_pose[0]) +
+                (ey - target_pose[1]) * (ey - target_pose[1]) +
+                (ez - target_pose[2]) * (ez - target_pose[2]));
+        }
+
+        if (is_ori) {
+            T r[3] = {
+                s_jointXforms[joint * 16 + 6] - s_jointXforms[joint * 16 + 9],
+                s_jointXforms[joint * 16 + 8] - s_jointXforms[joint * 16 + 2],
+                s_jointXforms[joint * 16 + 1] - s_jointXforms[joint * 16 + 4]
+            };
+
+            T tr = s_jointXforms[joint * 16 + 0]
+                + s_jointXforms[joint * 16 + 5]
+                + s_jointXforms[joint * 16 + 10];
+
+            T r_n = 2.0f * sinf(acosf((tr - 1) / 2.0f));
+            r[0] /= r_n; r[1] /= r_n; r[2] /= r_n;
+
+            // convert R_ee to q_ee
+            T q_ee[4];
+            mat_to_quat(&s_jointXforms[6 * 16], q_ee);
+            normalize_quat(q_ee);
+
+            T q_t[4] = {
+                target_pose[3], target_pose[4],
+                target_pose[5], target_pose[6]
+            };
+
+            // get q_err = q_t * q^{-1}_ee
+            T q_ee_inv[4] = { q_ee[0], -q_ee[1], -q_ee[2], -q_ee[3] };
+            T q_err[4];
+            multiply_quat(q_t, q_ee_inv, q_err);
+            normalize_quat(q_err);
+
+            // convert to axis-angle
+            T phi = 2.0f * acosf(q_err[0]);
+            T sin_h = sinf(phi / 2.0f);
+            T a[3] = { 1, 0, 0 };
+            if (sin_h > 1e-6f) {
+                a[0] = q_err[1] / sin_h;
+                a[1] = q_err[2] / sin_h;
+                a[2] = q_err[3] / sin_h;
+            }
+
+            T sign = a[0] * r[0] + a[1] * r[1] + a[2] * r[2];
+            T delta = 0.75f + 0.25f * logf((float)(k + 1)) / logf((float)k_max);
+            //T delta = 0.75f;
+            T theta_update = (sign < 0 ? -phi : phi) * delta;
+            s_ori_theta[joint] = theta_update;
+
+            T cand[N];
+            for (int j = 0; j < N; ++j) {
+                cand[j] = (j == joint) ? clamp_val(s_x[j] + theta_update, -c_omega[j], c_omega[j]) : s_x[j];
+            }
+
+            T CX[N * 16];
+            memcpy(CX, s_XmatsHom, sizeof(CX));
+            grid::update_singleJointX(CX, CX, cand, N - 1);
+            T qc[4];
+            mat_to_quat(&CX[6 * 16], qc);
+            normalize_quat(qc);
+            T dotp = qc[0] * q_t[0] + qc[1] * q_t[1] + qc[2] * q_t[2] + qc[3] * q_t[3];
+            dotp = fminf(fmaxf(dotp, -1.0f), 1.0f);
+            s_ori_err[joint] = 2.0f * acosf(dotp);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            const float pos_weight = 1.0f;
+            const float ori_weight = 1.0f;
+
+            int best_j_pos = 0;
+            float best_pos_e = s_pos_err[0];
+            for (int j = 1; j < N; ++j) {
+                if (s_pos_err[j] < best_pos_e) {
+                    best_pos_e = s_pos_err[j];
+                    best_j_pos = j;
+                }
+            }
+
+            int best_j_ori = 0;
+            float best_ori_e = s_ori_err[0];
+            for (int j = 1; j < N; ++j) {
+                if (s_ori_err[j] < best_ori_e) {
+                    best_ori_e = s_ori_err[j];
+                    best_j_ori = j;
+                }
+            }
+
+            if (best_j_pos != best_j_ori) {
+                // Position update
+                T ntp = s_x[best_j_pos] + s_pos_theta[best_j_pos];
+                joint_limits(&ntp, best_j_pos);
+                s_x[best_j_pos] = ntp;
+                s_glob_pos_err = best_pos_e;
+
+                // Orientation update
+                T nto = s_x[best_j_ori] + s_ori_theta[best_j_ori];
+                joint_limits(&nto, best_j_ori);
+                s_x[best_j_ori] = nto;
+                s_glob_ori_err = best_ori_e;
+            }
+            else {
+                // If they collide, pick the one with larger weighted residual
+                if (pos_weight * s_glob_pos_err > ori_weight * s_glob_ori_err) {
+                    T nt = s_x[best_j_pos] + s_pos_theta[best_j_pos];
+                    joint_limits(&nt, best_j_pos);
+                    s_x[best_j_pos] = nt;
+                    s_glob_pos_err = best_pos_e;
+                }
+                else {
+                    T nt = s_x[best_j_ori] + s_ori_theta[best_j_ori];
+                    joint_limits(&nt, best_j_ori);
+                    s_x[best_j_ori] = nt;
+                    s_glob_ori_err = best_ori_e;
+                }
+            }
+
+            // 4) Reset your per‐joint candidate deltas
+            for (int j = 0; j < N; ++j) {
+                s_pos_theta[j] = s_ori_theta[j] = 0;
+            }
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            grid::update_singleJointX(s_jointXforms, s_XmatsHom, s_x, N - 1);
+
+            T fx = s_jointXforms[6 * 16 + 12];
+            T fy = s_jointXforms[6 * 16 + 13];
+            T fz = s_jointXforms[6 * 16 + 14];
+
+            T fq[4];
+            mat_to_quat(&s_jointXforms[6 * 16], fq);
+            normalize_quat(fq);
+
+            s_pose[0] = fx;
+            s_pose[1] = fy;
+            s_pose[2] = fz;
+            s_pose[3] = fq[0];
+            s_pose[4] = fq[1];
+            s_pose[5] = fq[2];
+            s_pose[6] = fq[3];
+
+            T pos_err = sqrtf(
+                (target_pose[0] - fx) * (target_pose[0] - fx) +
+                (target_pose[1] - fy) * (target_pose[1] - fy) +
+                (target_pose[2] - fz) * (target_pose[2] - fz)
+            );
+
+            s_glob_pos_err = pos_err;
+
+            T q_t[4] = {
+                target_pose[3], target_pose[4],
+                target_pose[5], target_pose[6]
+            };
+
+            T q_ee_inv[4] = { fq[0] , -fq[1], -fq[2], -fq[3] };
+            T q_err[4];
+            multiply_quat(q_t, q_ee_inv, q_err);
+            normalize_quat(q_err);
+
+            s_glob_ori_err = 2.0f * acosf(q_err[0]);
+        }
+        __syncthreads();
+
+        if (s_glob_ori_err < nu && s_glob_pos_err < epsilon) {
+            atomicAdd(&n_solutions, 1);
+        }
+        //__syncthreads();
+
+        if (n_solutions >= num_solutions) {
+            break;
+        }
+    }
+    
+    if (tid < N)
+        x[P * N + tid] = s_x[tid];
+    if (tid < 7)
+        pose[P * 7 + tid] = s_pose[tid];
+    if (tid == 0) {
+        pos_errors[P] = s_glob_pos_err * 1000.0f;
+        ori_errors[P] = s_glob_ori_err * (180.0f / PI);
+    }
+}
+*/
+
+/*
+template<typename T>
+void sample_joint_configs_range(T* x, const float* omega, int start, int end, int thread_id) {
+    std::mt19937 gen(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()) + thread_id * 997);
     for (int i = start; i < end; i += N) {
         for (int j = 0; j < N - 1; ++j) {
-            std::uniform_real_distribution<> dist(-omega[j], omega[j]);
-            x[i + j] = static_cast<T>(dist(gen));
+            std::uniform_real_distribution<T> dist(-omega[j], omega[j]);
+            x[i + j] = dist(gen);
         }
         x[i + N - 1] = static_cast<T>(0.0);
     }
 }
-/*
+
 template<typename T>
 void sample_joint_configs_parallel(T* x, const float* omega, int num_elements) {
-    int total_problems = num_elements / N;
-    const int num_threads = 10;
-    int problems_per_thread = total_problems / num_threads;
-    int remainder = total_problems % num_threads;
+    const int total_problems = num_elements / N;
+    const int effective_total_problems = ((total_problems + IK_PER_BLOCK - 1) / IK_PER_BLOCK) * IK_PER_BLOCK;
+
+    const int num_threads = std::min(32, effective_total_problems);
+    const int problems_per_thread = effective_total_problems / num_threads;
+    const int remainder = effective_total_problems % num_threads;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
@@ -724,40 +1079,15 @@ void sample_joint_configs_parallel(T* x, const float* omega, int num_elements) {
         int thread_problems = problems_per_thread + (i < remainder ? 1 : 0);
         int start_index = start_problem * N;
         int end_index = (start_problem + thread_problems) * N;
-        threads.emplace_back(sample_joint_configs_range<T>, x, omega, start_index, end_index);
+        threads.emplace_back(sample_joint_configs_range<T>, x, omega, start_index, end_index, i);
         start_problem += thread_problems;
     }
+
     for (auto& t : threads) {
         t.join();
     }
 }
 */
-
-template<typename T>
-void sample_joint_configs_parallel(T* x, const float* omega, int num_elements) {
-    int total_problems = num_elements / N;
-    // Ensure total_problems is rounded up to a multiple of IK_PER_BLOCK
-    int effective_total_problems = ((total_problems + IK_PER_BLOCK - 1) / IK_PER_BLOCK) * IK_PER_BLOCK;
-
-    const int num_threads = 10;
-    int problems_per_thread = effective_total_problems / num_threads;
-    int remainder = effective_total_problems % num_threads;
-
-    std::vector<std::thread> threads;
-    threads.reserve(num_threads);
-
-    int start_problem = 0;
-    for (int i = 0; i < num_threads; ++i) {
-        int thread_problems = problems_per_thread + (i < remainder ? 1 : 0);
-        int start_index = start_problem * N;
-        int end_index = (start_problem + thread_problems) * N;
-        threads.emplace_back(sample_joint_configs_range<T>, x, omega, start_index, end_index);
-        start_problem += thread_problems;
-    }
-    for (auto& t : threads) {
-        t.join();
-    }
-}
 
 template<typename T>
 Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_robotModel, int num_solutions = 1) {
@@ -777,10 +1107,22 @@ Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_rob
     float* pos_errors = new float[effective_totalProblems];
     float* ori_errors = new float[effective_totalProblems];
 
-    auto start_sample = std::chrono::high_resolution_clock::now();
-    sample_joint_configs_parallel(x, omega, num_elements);
-    auto end_sample = std::chrono::high_resolution_clock::now();
-    auto elapsed_sample = std::chrono::duration_cast<std::chrono::milliseconds>(end_sample - start_sample);
+    //auto start_sample = std::chrono::high_resolution_clock::now();
+    //sample_joint_configs_parallel(x, omega, num_elements);
+    //auto end_sample = std::chrono::high_resolution_clock::now();
+    //auto elapsed_sample = std::chrono::duration_cast<std::chrono::milliseconds>(end_sample - start_sample);
+
+    /*
+    std::cout << "Sampled Joint Configurations (Total: " << effective_totalProblems << "):\n";
+    for (int i = 0; i < effective_totalProblems; ++i) {
+        std::cout << "Sample " << i << ": [";
+        for (int j = 0; j < N; ++j) {
+            std::cout << x[i * N + j];
+            if (j < N - 1) std::cout << ", ";
+        }
+        std::cout << "]\n";
+    }
+    */
 
     T* d_x, * d_pose, * d_target_pose;
     float* d_pos_errors, * d_ori_errors;
@@ -793,10 +1135,13 @@ Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_rob
     cudaMemcpy(d_x, x, num_elements * sizeof(T), cudaMemcpyHostToDevice);
     cudaMemcpy(d_target_pose, target_pose, 7 * sizeof(T), cudaMemcpyHostToDevice);
 
-    dim3 blockDim(IK_PER_BLOCK * (2 * N));
-    int grid_x = (effective_totalProblems) / IK_PER_BLOCK;
-    dim3 gridDim(grid_x);
+    //dim3 blockDim(IK_PER_BLOCK * (2 * N));
+    //int grid_x = (effective_totalProblems) / IK_PER_BLOCK;
+    //dim3 gridDim(grid_x);
 
+    dim3 blockDim(2 * N, IK_PER_BLOCK);
+    dim3 gridDim((effective_totalProblems + IK_PER_BLOCK - 1) / IK_PER_BLOCK);
+    
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
@@ -809,9 +1154,9 @@ Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_rob
         d_pos_errors,
         d_ori_errors,
         num_solutions,
-        totalProblems,
+        effective_totalProblems,
         d_robotModel
-    );
+        );
 
     cudaDeviceSynchronize();
     cudaEventRecord(stop);
@@ -828,7 +1173,7 @@ Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_rob
     std::vector<std::pair<float, int>> errorIndex;
     errorIndex.reserve(totalProblems);
 
-    const float pos_weight = 100.0f;// 5.0f;
+    const float pos_weight = 5.0f;// 5.0f;
     const float ori_weight = 1.0f;// 0.05f;
 
     for (int i = 0; i < totalProblems; ++i) {
@@ -876,7 +1221,7 @@ Result<T> generate_ik_solutions(T* target_pose, const grid::robotModel<T>* d_rob
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    result.elapsed_time = milliseconds + static_cast<float>(elapsed_sample.count());
+    result.elapsed_time = milliseconds;// +static_cast<float>(elapsed_sample.count());
     result.pos_errors = best_pos_errors;
     result.ori_errors = best_ori_errors;
     result.pose = best_poses;

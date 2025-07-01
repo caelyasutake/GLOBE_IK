@@ -1,0 +1,6 @@
+Batch-Size: [1]
+IK-time(ms): [31.5155525]
+Orientation-Error: [122.342453]
+Position-Error(mm): [162.705719]
+Success-IK: [0]
+robot: [franka.yml]

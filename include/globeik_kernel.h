@@ -10,12 +10,15 @@ namespace grid {
 #else
 #ifdef __CUDACC__
 #include <GRiD/grid.cuh>
+//#include <GRiD/panda_grid.cuh>
 #else
 namespace grid {
     template<typename T>
     struct robotModel;
     template<typename T>
     robotModel<T>* init_robotModel();
+
+    
 }
 #endif
 #endif
@@ -41,10 +44,10 @@ __global__ void globeik_kernel(
     int num_solutions,
     int total_problems,
     const grid::robotModel<T>* d_robotModel,
-    const float epsilon = 0.001,
+    const float epsilon = 0.005, // 1mm
     const float gamma = 0.5,
-    const float nu = 2.0,
-    const int k_max = 10);
+    const float nu = 0.0872665, // 5 degrees
+    const int k_max = 40);
 
 template<typename T>
 struct Result {

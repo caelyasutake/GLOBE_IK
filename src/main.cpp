@@ -11,7 +11,128 @@
 #include <yaml-cpp/yaml.h>
 
 #define NUM_RANDOM_TARGETS 1
+#define N 7
+#define NUM_TESTS 1
 
+int main() {
+    // --- 1) Load YAML ---
+    YAML::Node config = YAML::LoadFile("tests/mb_set.yaml");
+    YAML::Node bookshelf = config["bookshelf_small_panda"];
+    if (!bookshelf) {
+        std::cerr << "Error: 'bookshelf_small_panda' not found\n";
+        return 1;
+    }
+
+    std::vector<std::array<float, 7>> goalPoses;
+    for (std::size_t i = 0; i < bookshelf.size(); ++i) {
+        auto entry = bookshelf[i]["goal_pose"];
+        if (!entry) continue;
+
+        auto pos = entry["position_xyz"];
+        auto quat = entry["quaternion_wxyz"];
+        if (!pos || !quat || pos.size() != 3 || quat.size() != 4) continue;
+
+        std::array<float, 7> pose{};
+        for (int j = 0; j < 3; ++j) pose[j] = pos[j].as<float>();
+        for (int j = 0; j < 4; ++j) pose[3 + j] = quat[j].as<float>();
+        goalPoses.push_back(pose);
+    }
+    if (goalPoses.empty()) {
+        std::cerr << "No valid poses loaded\n";
+        return 1;
+    }
+
+    // --- 2) Prepare output ---
+    std::ofstream result_file("globeik_iiwa_robometrics.csv");
+    result_file << "Test, Solution, Solve Time (ms), Pos Error (mm), Ang Error (deg)\n";
+
+    // --- 3) Initialize robot model ---
+    auto* d_robotModel = grid::init_robotModel<float>();
+
+    // Toggle this to true to dump every solution
+    bool printAllSolutions = true;
+
+    // --- 4) Loop over tests (here we just do the first NUM_TESTS poses) ---
+    for (int i = 0; i < std::min<int>(NUM_TESTS, goalPoses.size()); ++i) {
+        // copy target into raw float*
+        float target_pose[7];
+        for (int j = 0; j < 7; ++j)
+            target_pose[j] = goalPoses[i][j];
+
+        for (int j = 0; j < 5; ++j) {
+            auto res = generate_ik_solutions<float>(target_pose, d_robotModel, NUM_SOLUTIONS);
+        }
+
+        // solve
+        auto res = generate_ik_solutions<float>(target_pose, d_robotModel, NUM_SOLUTIONS);
+
+        // header
+        std::cout << "\n=== Case " << (i + 1) << " of " << goalPoses.size() << " ===\n";
+        std::cout << "Target Pose: ";
+        for (int j = 0; j < 7; ++j)
+            std::cout << target_pose[j] << (j < 6 ? ", " : "\n");
+
+        if (printAllSolutions) {
+            // print every solution
+            for (int s = 0; s < NUM_SOLUTIONS; ++s) {
+                std::cout << " Solution " << (s + 1) << ":\n";
+                std::cout << "  Pose:   ";
+                for (int j = 0; j < 7; ++j)
+                    std::cout << res.pose[7 * s + j] << (j < 6 ? ", " : "\n");
+                std::cout << "  Joints: ";
+                for (int j = 0; j < N; ++j)
+                    std::cout << res.joint_config[N * s + j] << (j < N - 1 ? ", " : "\n");
+
+                // existing error print
+                std::cout << "  PosErr: " << res.pos_errors[s]
+                    << " mm, OriErr: " << res.ori_errors[s] << " deg\n";
+
+                // **new** elapsed-time print
+                std::cout << "  Time:   " << res.elapsed_time << " ms\n\n";
+
+                // CSV line
+                result_file
+                    << (i + 1) << ", " << (s + 1) << ", "
+                    << res.elapsed_time << ", "
+                    << res.pos_errors[s] << ", "
+                    << res.ori_errors[s] << "\n";
+            }
+        }
+        else {
+            // only best (index 0)
+            std::cout << " Best Pose:   ";
+            for (int j = 0; j < 7; ++j)
+                std::cout << res.pose[j] << (j < 6 ? ", " : "\n");
+            std::cout << " Best Joints: ";
+            for (int j = 0; j < N; ++j)
+                std::cout << res.joint_config[j] << (j < N - 1 ? ", " : "\n");
+
+            // existing error print
+            std::cout << " Pos Error: " << res.pos_errors[0]
+                << " mm, Ori Error: " << res.ori_errors[0] << " deg\n";
+
+            // **new** elapsed-time print
+            std::cout << " Elapsed Time: " << res.elapsed_time << " ms\n\n";
+
+            // CSV line (solution=1)
+            result_file
+                << (i + 1) << ", 1, "
+                << res.elapsed_time << ", "
+                << res.pos_errors[0] << ", "
+                << res.ori_errors[0] << "\n";
+        }
+
+        // cleanup
+        delete[] res.joint_config;
+        delete[] res.pose;
+        delete[] res.pos_errors;
+        delete[] res.ori_errors;
+    }
+
+    return 0;
+}
+
+/*
 int main() {
     YAML::Node config;
     try {
@@ -55,14 +176,14 @@ int main() {
             continue;
         }
 
-        std::vector<float> targetPose;
+        std::vector<float> target_pose;
         for (std::size_t j = 0; j < pos_node.size(); j++) {
-            targetPose.push_back(pos_node[j].as<float>());
+            target_pose.push_back(pos_node[j].as<float>());
         }
         for (std::size_t j = 0; j < quat_node.size(); j++) {
-            targetPose.push_back(quat_node[j].as<float>());
+            target_pose.push_back(quat_node[j].as<float>());
         }
-        goalPoses.push_back(targetPose);
+        goalPoses.push_back(target_pose);
 
         YAML::Node start_node = entry["start"];
         if (!start_node || start_node.size() != 7) {
@@ -109,76 +230,75 @@ int main() {
     grid::robotModel<float>* d_robotModel = grid::init_robotModel<float>();
 
     result_file << "Test, Solve Time (ms), Pos Error (mm), Ang Error (deg),\n";
-    for (int i = 0; i < goalPoses.size(); ++i) {
-    //for(int i=0; i<1; ++i) {
-        float* target_pose = new float[7];
+
+    bool printAllSolutions = false;
+
+    //for (int i = 0; i < goalPoses.size(); ++i) {
+    for(int i=0; i<1; ++i) {
+        Result<float> res = generate_ik_solutions<float>(target_pose, d_robotModel, NUM_SOLUTIONS);
+
+        std::cout << "Case [" << (i + 1) << "] of " << goalPoses.size() << "\n";
+        std::cout << "Target Pose: ";
         for (int j = 0; j < 7; ++j) {
-            target_pose[j] = goalPoses[i][j];
+            std::cout << target_pose[j] << (j < 6 ? ", " : "\n");
         }
 
-        Result<float> res;
-        res = generate_ik_solutions<float>(target_pose, d_robotModel, NUM_SOLUTIONS);
-
-        std::cout << "target: ";
-        for (int j = 0; j < 7; ++j) {
-            std::cout << target_pose[j] << ", ";
+        if (printAllSolutions) {
+            // print every solution
+            for (int s = 0; s < NUM_SOLUTIONS; ++s) {
+                std::cout << " Solution " << (s + 1) << ":\n";
+                std::cout << "  Pose:   ";
+                for (int j = 0; j < 7; ++j) {
+                    std::cout << res.pose[s * 7 + j] << (j < 6 ? ", " : "\n");
+                }
+                std::cout << "  Joints: ";
+                for (int j = 0; j < N; ++j) {
+                    std::cout << res.joint_config[s * N + j] << (j < N - 1 ? ", " : "\n");
+                }
+                std::cout << "  PosErr: " << res.pos_errors[s]
+                    << " mm, OriErr: " << res.ori_errors[s] << " deg\n";
+            }
         }
-        std::cout << std::endl;
-
-        std::cout << "pose: ";
-        for (int j = 0; j < 7; ++j) {
-            std::cout << res.pose[j] << ", ";
+        else {
+            // print only the best (index 0)
+            std::cout << " Best Pose:   ";
+            for (int j = 0; j < 7; ++j) {
+                std::cout << res.pose[j] << (j < 6 ? ", " : "\n");
+            }
+            std::cout << " Best Joints: ";
+            for (int j = 0; j < N; ++j) {
+                std::cout << res.joint_config[j] << (j < N - 1 ? ", " : "\n");
+            }
+            std::cout << " Pos Error: " << res.pos_errors[0]
+                << " mm, Ori Error: " << res.ori_errors[0] << " deg\n";
         }
-        std::cout << std::endl;
 
-        std::cout << "x: ";
-        for (int j = 0; j < 7; ++j) {
-            std::cout << res.joint_config[j] << ", ";
+        // optionally also write them all to CSV:
+        if (printAllSolutions) {
+            for (int s = 0; s < NUM_SOLUTIONS; ++s) {
+                result_file << (i + 1) << "_sol" << (s + 1) << ", "
+                    << res.elapsed_time << ", "
+                    << res.pos_errors[s] << ", "
+                    << res.ori_errors[s] << "\n";
+            }
         }
-        std::cout << std::endl;
-
-        //float avg_serr = 0.0;
-        //for (int j = 0; j < NUM_SOLUTIONS; ++j) {
-        //    avg_serr += res.errors[j];
-        //}
-        //avg_serr /= NUM_SOLUTIONS;
-
-        //float best_err = res.errors[0] * 1000.0;
-
-        float avg_pos_err = 0.0f;
-        float avg_ori_err = 0.0f;
-        for (int j = 0; j < NUM_SOLUTIONS; ++j) {
-            avg_pos_err += res.pos_errors[j];
-            avg_ori_err += res.ori_errors[j];
+        else {
+            result_file << (i + 1) << ", "
+                << res.elapsed_time << ", "
+                << res.pos_errors[0] << ", "
+                << res.ori_errors[0] << "\n";
         }
-        avg_pos_err /= NUM_SOLUTIONS;
-        avg_ori_err /= NUM_SOLUTIONS;
 
-        float best_pos_err = res.pos_errors[0] * 1000.0;
-        float best_ori_err = res.ori_errors[0];
-
-        result_file << (i + 1) << ", "
-            << (res.elapsed_time) << ", "
-            //<< (best_err) << "\n";
-            << (best_pos_err) << ", "
-            << (best_ori_err) << "\n";
-
-        delete[] target_pose;
+        // clean up…
         delete[] res.joint_config;
         delete[] res.pose;
-        //delete[] res.errors;
         delete[] res.pos_errors;
         delete[] res.ori_errors;
-
-        std::cout << "Case [" << i + 1 << "] out of " << goalPoses.size() << std::endl;
-        std::cout << "Elapsed Time (ms): " << res.elapsed_time << std::endl;
-        //std::cout << "Error (mm): " << best_err << std::endl;
-        std::cout << "Pos Error (mm): " << best_pos_err << std::endl;
-        std::cout << "Ang Error (deg): " << best_ori_err << std::endl;
     }
 
     return 0;
 }
+*/
 
 /*
 int main() {
